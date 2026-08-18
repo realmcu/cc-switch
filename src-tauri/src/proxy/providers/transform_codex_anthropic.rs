@@ -1698,7 +1698,7 @@ mod tests {
     }
 
     #[test]
-    fn test_request_tool_search_output_schema_defaults_root_type_to_object() {
+    fn test_request_tool_search_output_schema_flattens_root_one_of() {
         let input = json!({
             "model": "claude",
             "max_output_tokens": 100,
@@ -1725,14 +1725,9 @@ mod tests {
         let input_schema = &result["tools"][0]["input_schema"];
 
         assert_eq!(input_schema["type"], "object");
-        assert_eq!(
-            input_schema["oneOf"][0]["properties"]["mode"]["type"],
-            "string"
-        );
-        assert_eq!(
-            input_schema["oneOf"][1]["properties"]["name"]["type"],
-            "string"
-        );
+        assert!(input_schema.get("oneOf").is_none());
+        assert_eq!(input_schema["properties"]["mode"]["type"], "string");
+        assert_eq!(input_schema["properties"]["name"]["type"], "string");
     }
 
     #[test]

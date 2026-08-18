@@ -22,7 +22,7 @@ use crate::proxy::{
         TOOL_RESULT_MEDIA_MOVED_MARKER,
     },
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 
 const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
@@ -1216,12 +1216,34 @@ fn serialize_tool_definition_for_description(tool: &Value) -> String {
 ///
 /// Some Responses tools carry `parameters: null` or `parameters: {"type": null}`,
 /// but OpenAI Chat Completions strictly requires `{"type": "object", "properties": {...}}`.
+///
+/// Strict OpenAI-compatible providers also reject top-level `oneOf` and `anyOf`.
+/// Flatten object alternatives without changing the shape of the tool arguments:
+/// properties are unioned, required names are intersected, and conflicting property
+/// schemas remain alternatives below the property level.
 fn normalize_function_parameters(params: Option<&Value>) -> Value {
     let mut params = match params {
         Some(Value::Object(obj)) => Value::Object(obj.clone()),
         _ => json!({"type": "object", "properties": {}}),
     };
+
     if let Some(obj) = params.as_object_mut() {
+        let composition_keys = ["oneOf", "anyOf", "allOf", "enum", "const", "not"];
+        let present_composition_keys = composition_keys
+            .iter()
+            .filter(|keyword| obj.contains_key(**keyword))
+            .copied()
+            .collect::<Vec<_>>();
+        if let [keyword @ ("oneOf" | "anyOf")] = present_composition_keys.as_slice() {
+            let alternatives = obj.remove(*keyword).expect("composition key is present");
+            if !flatten_object_alternatives(obj, &alternatives) {
+                // Strict flattening failed (e.g. alternatives have extra constraints like
+                // `minProperties` or `description`). Fall back to a lossy merge that unions
+                // properties from object-typed alternatives and removes the keyword so that
+                // LiteLLM's top-level schema validator does not reject the request.
+                loosely_merge_object_alternatives(obj, &alternatives);
+            }
+        }
         match obj.get("type").and_then(|v| v.as_str()) {
             Some("object") => {}
             _ => {
@@ -1230,6 +1252,195 @@ fn normalize_function_parameters(params: Option<&Value>) -> Value {
         }
     }
     params
+}
+
+fn flatten_object_alternatives(schema: &mut Map<String, Value>, alternatives: &Value) -> bool {
+    let Some(raw_alternatives) = alternatives.as_array() else {
+        return false;
+    };
+    if schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| !properties.is_empty())
+        || schema
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| !required.is_empty())
+        || schema.get("additionalProperties") == Some(&Value::Bool(false))
+        || raw_alternatives.is_empty()
+    {
+        return false;
+    }
+
+    let mut alternatives = Vec::new();
+    for alternative in raw_alternatives {
+        if !collect_object_alternatives(alternative, &mut alternatives) {
+            return false;
+        }
+    }
+
+    let mut properties = Map::new();
+    let mut common_required: Option<HashSet<String>> = None;
+    let mut all_closed = true;
+
+    for alternative in alternatives {
+        let object = alternative;
+        let required = object
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        common_required = Some(match common_required {
+            Some(common) => common.intersection(&required).cloned().collect(),
+            None => required,
+        });
+        all_closed &= object.get("additionalProperties") == Some(&Value::Bool(false));
+
+        if let Some(branch_properties) = object.get("properties").and_then(Value::as_object) {
+            for (name, property_schema) in branch_properties {
+                merge_property_schema(&mut properties, name, property_schema);
+            }
+        }
+    }
+
+    let mut required = common_required
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<Vec<_>>();
+    required.sort();
+
+    schema.insert("properties".to_string(), Value::Object(properties));
+    if required.is_empty() {
+        schema.remove("required");
+    } else {
+        schema.insert("required".to_string(), json!(required));
+    }
+    if all_closed {
+        schema.insert("additionalProperties".to_string(), Value::Bool(false));
+    }
+    true
+}
+
+fn collect_object_alternatives<'a>(
+    schema: &'a Value,
+    alternatives: &mut Vec<&'a Map<String, Value>>,
+) -> bool {
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
+
+    let composition_keys = ["oneOf", "anyOf"]
+        .into_iter()
+        .filter(|keyword| object.contains_key(*keyword))
+        .collect::<Vec<_>>();
+    if let [keyword] = composition_keys.as_slice() {
+        if object.len() != 1 {
+            return false;
+        }
+        let Some(nested) = object.get(*keyword).and_then(Value::as_array) else {
+            return false;
+        };
+        if nested.is_empty() {
+            return false;
+        }
+        return nested
+            .iter()
+            .all(|alternative| collect_object_alternatives(alternative, alternatives));
+    }
+
+    if object.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "type" | "properties" | "required" | "additionalProperties"
+        )
+    }) && object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_none_or(|schema_type| schema_type == "object")
+    {
+        alternatives.push(object);
+        return true;
+    }
+
+    false
+}
+
+/// Lossy fallback: union `properties` from all alternatives that look like objects,
+/// ignoring unsupported constraints (e.g. `minProperties`, `description`, `$ref`).
+/// Does not try to be semantically precise — the goal is only to strip the top-level
+/// `oneOf`/`anyOf` so that strict LiteLLM schema validators accept the request.
+fn loosely_merge_object_alternatives(schema: &mut Map<String, Value>, alternatives: &Value) {
+    let Some(alternatives) = alternatives.as_array() else {
+        return;
+    };
+    let mut properties = schema
+        .remove("properties")
+        .and_then(|v| if let Value::Object(m) = v { Some(m) } else { None })
+        .unwrap_or_default();
+    for alternative in alternatives {
+        let Some(object) = alternative.as_object() else {
+            continue;
+        };
+        let type_ok = object
+            .get("type")
+            .and_then(Value::as_str)
+            .is_none_or(|t| t == "object");
+        if !type_ok {
+            continue;
+        }
+        if let Some(branch_properties) = object.get("properties").and_then(Value::as_object) {
+            for (name, property_schema) in branch_properties {
+                merge_property_schema(&mut properties, name, property_schema);
+            }
+        }
+    }
+    schema.insert("properties".to_string(), Value::Object(properties));
+    schema.remove("required");
+}
+
+fn merge_property_schema(properties: &mut Map<String, Value>, name: &str, incoming: &Value) {
+    let Some(existing) = properties.get_mut(name) else {
+        properties.insert(name.to_string(), incoming.clone());
+        return;
+    };
+    if existing == incoming {
+        return;
+    }
+
+    let existing_const = existing.get("const");
+    let incoming_const = incoming.get("const");
+    if let (Some(existing_const), Some(incoming_const)) = (existing_const, incoming_const) {
+        let mut values = vec![existing_const.clone()];
+        if incoming_const != existing_const {
+            values.push(incoming_const.clone());
+        }
+        *existing = json!({"enum": values});
+        return;
+    }
+    if let Some(values) = existing.get_mut("enum").and_then(Value::as_array_mut) {
+        if let Some(incoming_const) = incoming_const {
+            if !values.contains(incoming_const) {
+                values.push(incoming_const.clone());
+            }
+            return;
+        }
+    }
+
+    let mut variants = existing
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| vec![existing.clone()]);
+    if !variants.contains(incoming) {
+        variants.push(incoming.clone());
+    }
+    *existing = json!({"anyOf": variants});
 }
 
 fn responses_function_tool_to_chat_tool(tool: &Value, chat_name: &str) -> Option<Value> {
@@ -2309,48 +2520,6 @@ mod tests {
         assert_eq!(parameters["type"], "object");
         assert_eq!(parameters["properties"]["query"]["type"], "string");
         assert_eq!(parameters["required"], json!(["query"]));
-    }
-
-    #[test]
-    fn responses_request_to_chat_defaults_top_level_one_of_tool_parameters_to_object() {
-        let input = json!({
-            "model": "gpt-5.4",
-            "tools": [{
-                "type": "function",
-                "name": "lookup",
-                "parameters": {
-                    "oneOf": [
-                        {
-                            "type": "object",
-                            "properties": {"id": {"type": "string"}}
-                        },
-                        {
-                            "type": "object",
-                            "properties": {"slug": {"type": "string"}}
-                        }
-                    ]
-                }
-            }],
-            "input": "hi"
-        });
-
-        let result = responses_to_chat_completions(input).unwrap();
-        let parameters = &result["tools"][0]["function"]["parameters"];
-
-        assert_eq!(parameters["type"], "object");
-        assert_eq!(
-            parameters["oneOf"],
-            json!([
-                {
-                    "type": "object",
-                    "properties": {"id": {"type": "string"}}
-                },
-                {
-                    "type": "object",
-                    "properties": {"slug": {"type": "string"}}
-                }
-            ])
-        );
     }
 
     #[test]
