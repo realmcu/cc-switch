@@ -1,0 +1,205 @@
+name: Windows and Linux Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Repository containing the source to build
+        required: true
+        default: fork
+        type: choice
+        options:
+          - upstream
+          - fork
+      ref:
+        description: Tag, branch, or commit to build
+        required: true
+        default: codex/v3.20.0-local-fix
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Resolve build source
+        id: source
+        shell: pwsh
+        env:
+          BUILD_SOURCE: ${{ inputs.source }}
+          BUILD_REF: ${{ inputs.ref }}
+        run: |
+          $repository = if ($env:BUILD_SOURCE -eq "fork") {
+            "realmcu/cc-switch"
+          } else {
+            "farion1231/cc-switch"
+          }
+          $artifactRef = $env:BUILD_REF -replace '[^A-Za-z0-9._-]', '-'
+          if ([string]::IsNullOrWhiteSpace($artifactRef)) {
+            throw "The ref does not contain any characters usable in an artifact name"
+          }
+          "repository=$repository" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "artifact_ref=$artifactRef" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Checkout selected version
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ steps.source.outputs.repository }}
+          ref: ${{ inputs.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.12.3
+          run_install: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build unsigned MSI
+        shell: pwsh
+        run: pnpm tauri build --bundles msi --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Prepare artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $msi = Get-ChildItem -Path src-tauri/target/release/bundle/msi -Filter *.msi -File | Select-Object -First 1
+          if (-not $msi) { throw "MSI artifact was not generated" }
+          Copy-Item $msi.FullName "artifacts/CC-Switch-${{ steps.source.outputs.artifact_ref }}-Windows-x64.msi"
+
+          $exe = Get-Item src-tauri/target/release/cc-switch.exe
+          $portableDir = "artifacts/CC-Switch-Portable"
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+          Copy-Item $exe.FullName "$portableDir/CC-Switch.exe"
+          Set-Content -Path "$portableDir/.cc-switch-portable" -Value "# CC Switch portable build marker" -Encoding ascii
+          Compress-Archive -Path "$portableDir/*", "$portableDir/.cc-switch-portable" -DestinationPath "artifacts/CC-Switch-${{ steps.source.outputs.artifact_ref }}-Windows-x64-Portable.zip"
+          Remove-Item -Recurse -Force $portableDir
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: CC-Switch-${{ steps.source.outputs.artifact_ref }}-Windows-x64
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+  build-linux-x64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Resolve build source
+        id: source
+        shell: bash
+        env:
+          BUILD_SOURCE: ${{ inputs.source }}
+          BUILD_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$BUILD_SOURCE" == "fork" ]]; then
+            repository="realmcu/cc-switch"
+          else
+            repository="farion1231/cc-switch"
+          fi
+          artifact_ref=$(printf '%s' "$BUILD_REF" | sed 's/[^A-Za-z0-9._-]/-/g')
+          if [[ -z "$artifact_ref" ]]; then
+            echo "The ref does not contain any characters usable in an artifact name" >&2
+            exit 1
+          fi
+          echo "repository=$repository" >> "$GITHUB_OUTPUT"
+          echo "artifact_ref=$artifact_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout selected version
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ steps.source.outputs.repository }}
+          ref: ${{ inputs.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.12.3
+          run_install: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+
+      - name: Install Linux system dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            curl \
+            wget \
+            file \
+            patchelf \
+            libssl-dev \
+            rpm \
+            elfutils \
+            xdg-utils \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev \
+            || sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.0-dev
+          sudo apt-get install -y --no-install-recommends libsoup-3.0-dev \
+            || sudo apt-get install -y --no-install-recommends libsoup2.4-dev
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Linux packages
+        run: pnpm tauri build --bundles appimage,deb,rpm --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Prepare artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          artifact_ref="${{ steps.source.outputs.artifact_ref }}"
+
+          appimage=$(find src-tauri/target/release/bundle -type f -name '*.AppImage' -print -quit)
+          deb=$(find src-tauri/target/release/bundle -type f -name '*.deb' -print -quit)
+          rpm=$(find src-tauri/target/release/bundle -type f -name '*.rpm' -print -quit)
+
+          [[ -n "$appimage" ]] || { echo "AppImage artifact was not generated" >&2; exit 1; }
+          [[ -n "$deb" ]] || { echo "DEB artifact was not generated" >&2; exit 1; }
+          [[ -n "$rpm" ]] || { echo "RPM artifact was not generated" >&2; exit 1; }
+
+          cp "$appimage" "artifacts/CC-Switch-${artifact_ref}-Linux-x86_64.AppImage"
+          cp "$deb" "artifacts/CC-Switch-${artifact_ref}-Linux-x86_64.deb"
+          cp "$rpm" "artifacts/CC-Switch-${artifact_ref}-Linux-x86_64.rpm"
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: CC-Switch-${{ steps.source.outputs.artifact_ref }}-Linux-x86_64
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
