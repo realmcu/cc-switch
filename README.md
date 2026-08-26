@@ -13,8 +13,7 @@ Each patched branch is based on the matching upstream release tag and contains t
 ## Build Windows and Linux packages
 
 1. Open **Actions** → **Windows and Linux Build** → **Run workflow**.
-2. Choose `fork` to build a patched branch, or `upstream` to build an official release/tag/branch.
-3. Enter the desired ref. The default is `codex/v3.20.0-local-fix`.
+2. Enter the desired branch, tag, or commit from `realmcu/cc-switch`. The default is `codex/v3.20.0-local-fix`.
 
 The workflow produces:
 

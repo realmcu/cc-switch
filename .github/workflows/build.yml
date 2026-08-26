@@ -3,14 +3,6 @@ name: Windows and Linux Build
 on:
   workflow_dispatch:
     inputs:
-      source:
-        description: Repository containing the source to build
-        required: true
-        default: fork
-        type: choice
-        options:
-          - upstream
-          - fork
       ref:
         description: Tag, branch, or commit to build
         required: true
@@ -26,29 +18,22 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Resolve build source
+      - name: Resolve artifact name
         id: source
         shell: pwsh
         env:
-          BUILD_SOURCE: ${{ inputs.source }}
           BUILD_REF: ${{ inputs.ref }}
         run: |
-          $repository = if ($env:BUILD_SOURCE -eq "fork") {
-            "realmcu/cc-switch"
-          } else {
-            "farion1231/cc-switch"
-          }
           $artifactRef = $env:BUILD_REF -replace '[^A-Za-z0-9._-]', '-'
           if ([string]::IsNullOrWhiteSpace($artifactRef)) {
             throw "The ref does not contain any characters usable in an artifact name"
           }
-          "repository=$repository" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "artifact_ref=$artifactRef" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Checkout selected version
         uses: actions/checkout@v6
         with:
-          repository: ${{ steps.source.outputs.repository }}
+          repository: realmcu/cc-switch
           ref: ${{ inputs.ref }}
 
       - name: Setup Node.js
@@ -104,31 +89,24 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Resolve build source
+      - name: Resolve artifact name
         id: source
         shell: bash
         env:
-          BUILD_SOURCE: ${{ inputs.source }}
           BUILD_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
-          if [[ "$BUILD_SOURCE" == "fork" ]]; then
-            repository="realmcu/cc-switch"
-          else
-            repository="farion1231/cc-switch"
-          fi
           artifact_ref=$(printf '%s' "$BUILD_REF" | sed 's/[^A-Za-z0-9._-]/-/g')
           if [[ -z "$artifact_ref" ]]; then
             echo "The ref does not contain any characters usable in an artifact name" >&2
             exit 1
           fi
-          echo "repository=$repository" >> "$GITHUB_OUTPUT"
           echo "artifact_ref=$artifact_ref" >> "$GITHUB_OUTPUT"
 
       - name: Checkout selected version
         uses: actions/checkout@v6
         with:
-          repository: ${{ steps.source.outputs.repository }}
+          repository: realmcu/cc-switch
           ref: ${{ inputs.ref }}
 
       - name: Setup Node.js
